@@ -1,242 +1,254 @@
 # app.py
 import os
 import tempfile
+from typing import Optional, List, Dict, Any
 from datetime import datetime
-from typing import Optional, Dict, Any, List
 
 import streamlit as st
 
-# LangChain / connectors (adapt imports if your environment uses different package names)
+# LangChain / connectors (adapt if your installation uses slightly different names)
 from langchain_classic.chains import RetrievalQA
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_chroma import Chroma
+from langchain_classic.text_splitter import RecursiveCharacterTextSplitter
+
+# For PDF parsing
+import PyPDF2
 
 # -------------------------
-# Streamlit page & CSS
+# Config
 # -------------------------
-st.set_page_config(
-    page_title="Corporate Training RAG Bot",
-    page_icon="🎓",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
-st.title("RAG Chatbot with Streamlit (Gemini 2.0)")
+CHROMA_DB_DIR = "./chroma_db"  # persistent directory for vector DB
+CHROMA_COLLECTION_NAME = "training_docs_collection"
+EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+GEMINI_MODEL_NAME = "gemini-2.0-flash"  # change if your account requires another exact string
+
+# -------------------------
+# Streamlit UI setup
+# -------------------------
+st.set_page_config(page_title="RAG Chatbot (Gemini 2.0)", page_icon="🎓", layout="wide")
+st.title("Corporate Training RAG Bot — RAG + Gemini 2.0")
 
 st.markdown(
     """
-<style>
-    .main-header { font-size: 2.5rem; color: #1f77b4; font-weight: bold; text-align: center; margin-bottom: 1rem; }
-    .sub-header { text-align: center; color: #666; margin-bottom: 2rem; }
-    .chat-message { padding: 1rem; border-radius: 0.5rem; margin-bottom: 1rem; border-left: 4px solid; }
-    .user-message { background-color: #e3f2fd; border-left-color: #2196f3; }
-    .bot-message { background-color: #f5f5f5; border-left-color: #4caf50; }
-    .info-box { background-color: #fff3cd; padding: 1rem; border-radius: 0.5rem; border-left: 4px solid #ffc107; margin: 1rem 0; }
-</style>
-""",
-    unsafe_allow_html=True,
+This app indexes uploaded documents into Chroma and answers queries with a Gemini 2.0 LLM.
+**Steps**
+1. Add your Gemini API key to Streamlit secrets (`GEMINI_API_KEY`) or environment variable.  
+2. Upload documents (PDF or TXT).  
+3. Click *Index documents* to store embeddings.  
+4. Ask questions — answers come from the RAG pipeline.
+"""
+)
+
+st.sidebar.header("Authentication & Settings")
+st.sidebar.markdown(
+    "- Provide `GEMINI_API_KEY` in Streamlit secrets or as an environment variable.\n"
+    "- Chroma persistence: `./chroma_db` (change in CHROMA_DB_DIR variable)."
 )
 
 # -------------------------
-# How we load the Gemini key (no user input)
+# Securely get Gemini key (no UI password input)
 # -------------------------
 def get_gemini_key() -> Optional[str]:
-    """
-    Priority:
-      1. st.secrets["GEMINI_API_KEY"]
-      2. os.environ["GEMINI_API_KEY"]
-      3. None if not found
-    """
     try:
-        secret_key = st.secrets.get("GEMINI_API_KEY") if hasattr(st, "secrets") else None
-        if secret_key:
-            return secret_key
+        if hasattr(st, "secrets") and st.secrets.get("GEMINI_API_KEY"):
+            return st.secrets.get("GEMINI_API_KEY")
     except Exception:
         pass
     return os.environ.get("GEMINI_API_KEY")
 
 
+gemini_key = get_gemini_key()
+if not gemini_key:
+    st.sidebar.error("Gemini API key missing. Set GEMINI_API_KEY in Streamlit secrets or environment.")
+    st.stop()
+
 # -------------------------
-# In-memory conversation state
+# Utility: extract text from uploaded file
 # -------------------------
+def extract_text_from_pdf(file_bytes: bytes) -> str:
+    try:
+        reader = PyPDF2.PdfReader(fileobj=bytes_to_fileobj(file_bytes))
+        texts = []
+        for page in reader.pages:
+            try:
+                texts.append(page.extract_text() or "")
+            except Exception:
+                # continue gracefully if a page fails
+                continue
+        return "\n".join(texts).strip()
+    except Exception as e:
+        st.warning(f"PDF text extraction error: {e}")
+        return ""
+
+
+def extract_text_from_txt(file_bytes: bytes) -> str:
+    try:
+        return file_bytes.decode("utf-8", errors="ignore")
+    except Exception:
+        return str(file_bytes)
+
+
+def bytes_to_fileobj(b: bytes):
+    # helper to create a file-like object for PyPDF2
+    from io import BytesIO
+
+    return BytesIO(b)
+
+
+# -------------------------
+# RAG pipeline builder (cached)
+# -------------------------
+@st.cache_resource
+def build_rag_pipeline(api_key: str) -> Dict[str, Any]:
+    """
+    Returns: dict with keys: embeddings, vectorstore, retriever, qa_chain
+    """
+    # embeddings (local HF)
+    embeddings = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
+
+    # Chroma vectorstore with persistence
+    vectorstore = Chroma(
+        embedding_function=embeddings,
+        collection_name=CHROMA_COLLECTION_NAME,
+        persist_directory=CHROMA_DB_DIR,
+    )
+
+    retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
+
+    # Build LLM wrapper for Gemini 2.0 (try common signatures)
+    # Use the model name that works for your account; we'll force GEMINI_MODEL_NAME
+    try:
+        llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL_NAME, api_key=api_key)
+    except TypeError:
+        # fallback signatures in case of wrapper differences
+        try:
+            llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL_NAME, credentials={"api_key": api_key})
+        except Exception as e:
+            raise RuntimeError(f"Failed to construct ChatGoogleGenerativeAI: {e}")
+
+    qa_chain = RetrievalQA.from_chain_type(llm=llm, chain_type="stuff", retriever=retriever)
+    return {"embeddings": embeddings, "vectorstore": vectorstore, "retriever": retriever, "qa_chain": qa_chain}
+
+
+# Initialize pipeline
+try:
+    pipeline = build_rag_pipeline(gemini_key)
+except Exception as e:
+    st.error(f"Error initializing RAG pipeline: {e}")
+    st.stop()
+
+embeddings = pipeline["embeddings"]
+vectorstore = pipeline["vectorstore"]
+retriever = pipeline["retriever"]
+rag_chain = pipeline["qa_chain"]
+
+# -------------------------
+# Upload & index UI
+# -------------------------
+st.sidebar.header("Upload & Index Documents")
+uploaded_files = st.sidebar.file_uploader("Upload PDF or TXT files", type=["pdf", "txt"], accept_multiple_files=True)
+
+index_now = st.sidebar.button("Index uploaded documents")
+
+if uploaded_files:
+    st.sidebar.write(f"{len(uploaded_files)} file(s) ready to index:")
+    for f in uploaded_files:
+        st.sidebar.write(f"- {f.name} ({f.type})")
+
+if index_now:
+    if not uploaded_files:
+        st.sidebar.warning("No files uploaded.")
+    else:
+        total_chunks = 0
+        all_texts = []
+        all_metadatas = []
+
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=200)
+
+        progress_bar = st.sidebar.progress(0)
+        for idx, up in enumerate(uploaded_files):
+            name = up.name
+            raw = up.getvalue()
+            if name.lower().endswith(".pdf"):
+                text = extract_text_from_pdf(raw)
+            else:
+                text = extract_text_from_txt(raw)
+            if not text:
+                st.sidebar.warning(f"No text extracted from {name}. Skipping.")
+                continue
+
+            # create simple metadata
+            metadata = {"source": name, "uploaded_at": datetime.utcnow().isoformat()}
+
+            # split into chunks
+            chunks = splitter.split_text(text)
+            total_chunks += len(chunks)
+            all_texts.extend(chunks)
+            all_metadatas.extend([metadata.copy() for _ in chunks])
+
+            progress_bar.progress(int((idx + 1) / len(uploaded_files) * 100))
+
+        if all_texts:
+            # add to chroma
+            try:
+                vectorstore.add_texts(texts=all_texts, metadatas=all_metadatas)
+                # persist to disk if Chroma wrapper supports it (langchain_chroma typically does)
+                try:
+                    vectorstore.persist()
+                except Exception:
+                    # not all wrappers expose persist(); ignore if absent
+                    pass
+                st.success(f"Indexed {len(all_texts)} chunks from {len(uploaded_files)} file(s).")
+            except Exception as e:
+                st.error(f"Failed to index documents: {e}")
+        else:
+            st.sidebar.info("No text chunks to index after extraction.")
+
+# -------------------------
+# Query UI & Chat history
+# -------------------------
+st.markdown("---")
+st.header("Ask the RAG bot")
+
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
-# -------------------------
-# Training documents (paste your TRN001-TRN008 here)
-# -------------------------
-TRAINING_DOCUMENTS = [
-    # (same training docs content as before)
-]
+# Show chat messages
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
 
-# -------------------------
-# Load RAG pipeline (forces Gemini 2.0)
-# -------------------------
-@st.cache_resource
-def load_rag_pipeline(gemini_api_key: Optional[str]) -> Optional[Dict[str, Any]]:
-    """
-    Build RAG pipeline using Gemini 2.0 only.
-    Tries a few constructor signatures but always uses model='gemini-2.0'.
-    """
-    if not gemini_api_key:
-        return None
+# Query input
+query = st.chat_input("Ask a question about the uploaded documents...")
 
-    # Embeddings (local HF)
-    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
-
-    # Chroma vectorstore (in-memory by default). Add persist_directory for disk persistence.
-    vectorstore = Chroma(embedding_function=embeddings, collection_name="my_rag_collection")
-    retriever = vectorstore.as_retriever()
-
-    model_name = "gemini-2.0-flash"
-    llm = None
-    errors = []
-
-    # Try common constructor patterns while forcing model_name
-    try:
-        llm = ChatGoogleGenerativeAI(model=model_name, api_key=gemini_api_key)
-    except Exception as e:
-        errors.append(f"model={model_name}, api_key -> {type(e).__name__}: {e}")
-
-    if llm is None:
-        try:
-            llm = ChatGoogleGenerativeAI(model=model_name, credentials={"api_key": gemini_api_key})
-        except Exception as e:
-            errors.append(f"model={model_name}, credentials(api_key) -> {type(e).__name__}: {e}")
-
-    if llm is None:
-        try:
-            # Some wrappers expect `credentials` with nested structure or different key names
-            llm = ChatGoogleGenerativeAI(model=model_name, credentials={"key": gemini_api_key})
-        except Exception as e:
-            errors.append(f"model={model_name}, credentials(key) -> {type(e).__name__}: {e}")
-
-    if llm is None:
-        try:
-            # last-resort: pass dictionary-like single arg (some versions may accept this)
-            llm = ChatGoogleGenerativeAI({"model": model_name, "api_key": gemini_api_key})
-        except Exception as e:
-            errors.append(f"fallback dict constructor -> {type(e).__name__}: {e}")
-
-    if llm is None:
-        # None of the tried signatures worked — raise a helpful error with attempts
-        raise RuntimeError(
-            "Could not construct ChatGoogleGenerativeAI with model='gemini-2.0'. "
-            "Tried several constructor patterns. Errors:\n\n" + "\n".join(errors)
-            + "\n\nAction: verify your langchain_google_genai version and its constructor signature. "
-            "Run `pip show langchain-google-genai` and share the version if you want me to adapt the constructor."
-        )
-
-    # Build the RetrievalQA chain
-    qa_chain = RetrievalQA.from_chain_type(llm=llm, chain_type="stuff", retriever=retriever)
-    return {"qa_chain": qa_chain, "vectorstore": vectorstore, "embeddings": embeddings}
-
-
-# -------------------------
-# Acquire key (securely) and initialize pipeline
-# -------------------------
-gemini_key = get_gemini_key()
-
-if not gemini_key:
-    st.error(
-        "Gemini API key not found. Please set `GEMINI_API_KEY` in Streamlit secrets or as an environment variable."
-    )
-    st.info(
-        "Local example: create `.streamlit/secrets.toml` with:\n\nGEMINI_API_KEY = \"your_gemini_key_here\"\n\n"
-        "Or set an env var and run streamlit: \n\n"
-        "macOS / Linux:\nexport GEMINI_API_KEY='your_gemini_key_here'\nstreamlit run app.py\n\n"
-        "Windows PowerShell:\n$env:GEMINI_API_KEY='your_gemini_key_here'\nstreamlit run app.py"
-    )
-    st.stop()
-
-pipeline = load_rag_pipeline(gemini_key)
-if pipeline is None or pipeline.get("qa_chain") is None:
-    st.error("Failed to initialize the RAG pipeline. Check your Gemini API key and langchain-google-genai installation.")
-    st.stop()
-
-rag_chain = pipeline["qa_chain"]
-vectorstore = pipeline["vectorstore"]
-embeddings = pipeline["embeddings"]
-
-# -------------------------
-# Index training docs into Chroma (if present)
-# -------------------------
-def index_training_docs(vectorstore: Any, docs: List[Dict[str, Any]]):
-    try:
-        from langchain_core.documents import Document
-
-        to_index = []
-        for d in docs:
-            meta = {"title": d.get("title"), "id": d.get("id"), "category": d.get("category"), "level": d.get("level")}
-            content = f"{d.get('title')}\n\n{d.get('content')}"
-            to_index.append(Document(page_content=content, metadata=meta))
-        try:
-            vectorstore.add_documents(to_index)
-            return
-        except Exception:
-            pass
-    except Exception:
-        to_index = []
-        for d in docs:
-            meta = {"title": d.get("title"), "id": d.get("id"), "category": d.get("category"), "level": d.get("level")}
-            content = f"{d.get('title')}\n\n{d.get('content')}"
-            to_index.append((content, meta))
-
-    try:
-        texts = [t[0] if isinstance(t, tuple) else t.page_content for t in to_index]
-        metadatas = [t[1] if isinstance(t, tuple) else t.metadata for t in to_index]
-        vectorstore.add_texts(texts=texts, metadatas=metadatas)
-    except Exception as e:
-        st.warning(f"Indexing documents failed: {e}")
-
-
-if TRAINING_DOCUMENTS:
-    index_training_docs(vectorstore, TRAINING_DOCUMENTS)
-
-# -------------------------
-# File uploader (sidebar)
-# -------------------------
-def handle_file_upload():
-    uploaded_file = st.sidebar.file_uploader("Upload a document (txt, pdf)", type=["txt", "pdf"])
-    if uploaded_file is not None:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{uploaded_file.type.split('/')[-1]}") as tmp_file:
-            tmp_file.write(uploaded_file.getvalue())
-            tmp_file_path = tmp_file.name
-        st.sidebar.success("Document uploaded. You can implement ingestion to index it into Chroma.")
-        try:
-            os.remove(tmp_file_path)
-        except Exception:
-            pass
-
-
-handle_file_upload()
-
-# -------------------------
-# Display chat history and accept user input
-# -------------------------
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-if prompt := st.chat_input("Ask your training bot anything..."):
-    st.session_state.messages.append({"role": "user", "content": prompt})
+if query:
+    # store user message
+    st.session_state.messages.append({"role": "user", "content": query})
     with st.chat_message("user"):
-        st.markdown(prompt)
+        st.markdown(query)
 
+    # run RAG
     with st.chat_message("assistant"):
-        message_placeholder = st.empty()
-        full_response = ""
-
-        with st.spinner("Thinking..."):
+        placeholder = st.empty()
+        with st.spinner("Querying RAG pipeline..."):
             try:
-                response = rag_chain.run(prompt)
-                response_text = str(response) if not isinstance(response, str) else response
+                answer = rag_chain.run(query)
             except Exception as e:
-                response_text = f"Error calling Gemini 2.0 LLM: {e}"
+                answer = f"Error while running RAG: {e}"
+            placeholder.markdown(answer)
 
-            full_response += response_text
-            message_placeholder.markdown(full_response + "▌")
+    st.session_state.messages.append({"role": "assistant", "content": answer})
 
-        message_placeholder.markdown(full_response)
-
-    st.session_state.messages.append({"role": "assistant", "content": full_response})
+# -------------------------
+# Optional: quick retriever debug & preview
+# -------------------------
+with st.expander("Indexer info & debug"):
+    try:
+        count = vectorstore._collection.count() if hasattr(vectorstore, "_collection") else "unknown"
+    except Exception:
+        count = "unknown"
+    st.write(f"Chroma collection: {CHROMA_COLLECTION_NAME}")
+    st.write(f"Persist directory: {CHROMA_DB_DIR}")
+    st.write(f"Indexed documents (estimate): {count}")
