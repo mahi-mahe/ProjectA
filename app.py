@@ -2,6 +2,7 @@
 import os
 import tempfile
 from datetime import datetime
+from typing import Optional
 
 import streamlit as st
 
@@ -37,24 +38,35 @@ st.markdown(
 )
 
 # -------------------------
-# Advanced settings: Gemini key (password input)
+# How we load the Gemini key (no user input)
 # -------------------------
-with st.sidebar.expander("Advanced settings", expanded=True):
-    st.markdown("**Gemini / Google Generative AI Key**")
-    # password style input; not stored to disk - stored only in session_state
-    typed_key = st.text_input(
-        "Enter Gemini API key (kept in session only)", type="password", help="Provide your Google Gemini API key here (do not hardcode in the script)."
-    )
-    if st.button("Use this key for this session"):
-        # store securely in session (only in-memory for this session)
-        st.session_state["GEMINI_API_KEY"] = typed_key
-        st.success("Gemini key saved to session (in-memory).")
+def get_gemini_key() -> Optional[str]:
+    """
+    Priority:
+      1. Streamlit secrets: st.secrets["GEMINI_API_KEY"]
+      2. Environment variable: os.environ["GEMINI_API_KEY"]
+      3. None if not found
+    """
+    # Preferred: Streamlit secrets (works on Streamlit Cloud / deployed apps)
+    try:
+        secret_key = st.secrets.get("GEMINI_API_KEY")
+        if secret_key:
+            return secret_key
+    except Exception:
+        # st.secrets may raise if not present (older streamlit). ignore and fallback.
+        pass
 
-# Also show a reminder about secrets
+    # Fallback: environment variable
+    return os.environ.get("GEMINI_API_KEY")
+
+
+# Display a small sidebar note about secrets
 st.sidebar.markdown(
     """
-**Tip:** For persistent secure storage use `secrets.toml` or your environment, not the code.
-See: https://docs.streamlit.io/streamlit-cloud/get-started/deploy/advanced/secrets-management
+**Authentication (Gemini)**  
+This app reads the Gemini API key from **Streamlit secrets** (`GEMINI_API_KEY`) or from the environment variable `GEMINI_API_KEY`.
+- On Streamlit Cloud: add it in **Settings → Secrets** or create `.streamlit/secrets.toml`.
+- Locally: either set an env var or create `.streamlit/secrets.toml`.
 """
 )
 
@@ -65,18 +77,26 @@ if "messages" not in st.session_state:
     st.session_state.messages = []
 
 # -------------------------
-# Training documents (unchanged)
+# Training documents (paste your full TRAINING_DOCUMENTS here)
 # -------------------------
 TRAINING_DOCUMENTS = [
-    # ... paste your training dicts here (TRN001 - TRN008) ...
-    # For brevity I assume you keep the same TRAINING_DOCUMENTS list you had.
+    # Paste your TRN001 - TRN008 dicts here (same as your original data).
+    # Example:
+    # {
+    #    "title": "Python Programming Fundamentals",
+    #    "id": "TRN001",
+    #    "category": "Technical Skills",
+    #    "level": "Beginner",
+    #    "duration": "40 hours",
+    #    "content": "..."
+    # },
 ]
 
 # -------------------------
 # Load RAG pipeline (uses Gemini LLM + HuggingFace embeddings)
 # -------------------------
 @st.cache_resource
-def load_rag_pipeline(gemini_api_key: str | None):
+def load_rag_pipeline(gemini_api_key: Optional[str]):
     """
     Build RAG pipeline. Requires a Gemini API key (api passed directly to the LLM).
     Embeddings use a local Hugging Face model (sentence-transformers/all-MiniLM-L6-v2).
@@ -92,10 +112,6 @@ def load_rag_pipeline(gemini_api_key: str | None):
     # Create Chroma vectorstore (uses embeddings)
     vectorstore = Chroma(embedding_function=embeddings, collection_name="my_rag_collection")
 
-    # NOTE: you should index your documents into Chroma before querying.
-    # For this simplified example we won't persist a disk index; if you want persistence,
-    # configure Chroma() with persist_directory="path/to/db" and call .persist() after adding docs.
-
     retriever = vectorstore.as_retriever()
 
     # Create Gemini-based LLM via langchain_google_genai
@@ -110,97 +126,21 @@ def load_rag_pipeline(gemini_api_key: str | None):
     return {"qa_chain": qa_chain, "vectorstore": vectorstore, "embeddings": embeddings}
 
 
-# Grab key from session (preferred)
-gemini_key = st.session_state.get("GEMINI_API_KEY", None)
-
-# If user entered a key in the current sidebar box but didn't click the "Use this key" button
-# allow immediate usage without saving to session
-if not gemini_key and "typed_key" in locals() and typed_key:
-    gemini_key = typed_key
+# -------------------------
+# Acquire key (securely) and initialize pipeline
+# -------------------------
+gemini_key = get_gemini_key()
 
 if not gemini_key:
-    st.warning("Please provide your Gemini API key in the sidebar Advanced settings to enable the RAG functionality.")
-    st.info("You can still upload documents which will be processed locally, but the LLM queries require the API key.")
-    # Let the user still upload files or prepare docs; but stop before creating the LLM.
+    st.error(
+        "Gemini API key not found. Please set `GEMINI_API_KEY` in Streamlit secrets or as an environment variable."
+    )
+    st.info(
+        "Local setup example: create a file `.streamlit/secrets.toml` with:\n\n"
+        'GEMINI_API_KEY = "your_gemini_key_here"\n\n'
+        "Or run locally:\n\nexport GEMINI_API_KEY='your_gemini_key_here'  (macOS / Linux)\nsetx GEMINI_API_KEY \"your_gemini_key_here\" (Windows)"
+    )
     st.stop()
 
-# Build pipeline (cached)
 pipeline = load_rag_pipeline(gemini_key)
-if pipeline is None or pipeline.get("qa_chain") is None:
-    st.error("Failed to initialize the RAG pipeline. Check your Gemini API key and retry.")
-    st.stop()
-
-rag_chain = pipeline["qa_chain"]
-vectorstore = pipeline["vectorstore"]
-embeddings = pipeline["embeddings"]
-
-# -------------------------
-# (Optional) Index the in-memory TRAINING_DOCUMENTS into Chroma
-# -------------------------
-# A simple indexer: convert TRAINING_DOCUMENTS to small documents and add to vectorstore.
-# This is necessary so retriever has something to retrieve from.
-def index_training_docs(vectorstore, docs):
-    from langchain_core.documents import Document  # local import for clarity
-    to_index = []
-    for d in docs:
-        meta = {"title": d.get("title"), "id": d.get("id"), "category": d.get("category"), "level": d.get("level")}
-        content = f"{d.get('title')}\n\n{d.get('content')}"
-        to_index.append(Document(page_content=content, metadata=meta))
-    # Use vectorstore.add_documents or equivalent (Chroma API may differ based on version)
-    try:
-        vectorstore.add_documents(to_index)
-    except Exception:
-        # Some Chroma wrappers use .add_texts([...], metadatas=[...])
-        texts = [doc.page_content for doc in to_index]
-        metadatas = [doc.metadata for doc in to_index]
-        vectorstore.add_texts(texts=texts, metadatas=metadatas)
-
-# Index (only once — Chroma in-memory collection will be empty initially)
-index_training_docs(vectorstore, TRAINING_DOCUMENTS)
-
-# -------------------------
-# File uploader (sidebar)
-# -------------------------
-def handle_file_upload():
-    uploaded_file = st.sidebar.file_uploader("Upload a document (txt, pdf)", type=["txt", "pdf"])
-    if uploaded_file is not None:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{uploaded_file.type.split('/')[-1]}") as tmp_file:
-            tmp_file.write(uploaded_file.getvalue())
-            tmp_file_path = tmp_file.name
-        st.sidebar.success("Document uploaded. (You can index it in Chroma in your ingestion flow.)")
-        # In a real ingestion: load text, split, embed and add to Chroma using embeddings.add_texts(...)
-        try:
-            os.remove(tmp_file_path)
-        except Exception:
-            pass
-
-handle_file_upload()
-
-# -------------------------
-# Display chat history and accept user input
-# -------------------------
-for message in st.session_state.messages:
-    with st.chat_message(message["role"]):
-        st.markdown(message["content"])
-
-if prompt := st.chat_input("Ask your training bot anything..."):
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    with st.chat_message("assistant"):
-        message_placeholder = st.empty()
-        full_response = ""
-
-        with st.spinner("Thinking..."):
-            # Use the RAG chain to get an answer
-            try:
-                response = rag_chain.run(prompt)
-            except Exception as e:
-                response = f"Error calling Gemini LLM: {e}"
-            full_response += response
-            message_placeholder.markdown(full_response + "▌")
-
-        message_placeholder.markdown(full_response)
-
-    st.session_state.messages.append({"role": "assistant", "content": full_response})
+if pipeline is None or pipeline.get("qa_chain"_
