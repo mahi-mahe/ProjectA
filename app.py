@@ -88,7 +88,7 @@ def load_rag_pipeline(gemini_api_key: Optional[str]) -> Optional[Dict[str, Any]]
     vectorstore = Chroma(embedding_function=embeddings, collection_name="my_rag_collection")
     retriever = vectorstore.as_retriever()
 
-    model_name = "gemini-2.0"
+    model_name = "gemini-2.0-flash"
     llm = None
     errors = []
 
